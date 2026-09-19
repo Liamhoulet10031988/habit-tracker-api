@@ -1,0 +1,11 @@
+.idea/
+.venv/
+__pycache__/
+*.py[cod]
+.env
+.coverage
+coverage_html/
+schema.yml
+db.sqlite3
+*.log
+dump.rdb
