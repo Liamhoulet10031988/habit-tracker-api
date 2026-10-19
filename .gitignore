@@ -9,3 +9,6 @@ schema.yml
 db.sqlite3
 *.log
 dump.rdb
+staticfiles/
+celerybeat-schedule*
+venv/
