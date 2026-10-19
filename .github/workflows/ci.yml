@@ -1,0 +1,173 @@
+name: Habit Tracker CI/CD
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: habit-ci-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.12"
+  POETRY_VERSION: "2.3.3"
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: habit_tracker_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d habit_tracker_test"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+    env:
+      SECRET_KEY: ci-only-habit-tracker-secret-not-for-production
+      DEBUG: "False"
+      ALLOWED_HOSTS: localhost,127.0.0.1,testserver
+      POSTGRES_DB: habit_tracker_test
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_HOST: 127.0.0.1
+      POSTGRES_PORT: "5432"
+      REDIS_URL: redis://127.0.0.1:6379/15
+      TELEGRAM_BOT_TOKEN: ""
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install Poetry
+        run: pip install "poetry==${POETRY_VERSION}"
+      - name: Install dependencies
+        run: poetry install --no-root --no-interaction --no-ansi
+      - name: Check Django and migrations
+        run: |
+          poetry run python manage.py check
+          poetry run python manage.py makemigrations --check --dry-run
+          poetry run python manage.py migrate --noinput
+      - name: Run tests
+        run: poetry run python manage.py test --noinput
+
+  lint:
+    name: Linters
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install Poetry
+        run: pip install "poetry==${POETRY_VERSION}"
+      - name: Install dependencies
+        run: poetry install --no-root --no-interaction --no-ansi
+      - name: Run Flake8
+        run: poetry run flake8 config habits telegram_bot users manage.py --exclude="*/migrations/*"
+      - name: Check import sorting
+        run: poetry run isort config habits telegram_bot users manage.py --check-only --skip-glob="*/migrations/*"
+
+  build:
+    name: Docker image
+    runs-on: ubuntu-24.04-arm
+    needs: lint
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+      - name: Build image for verification
+        if: github.event_name != 'push' || (github.ref != 'refs/heads/develop' && github.ref != 'refs/heads/feature/habit-tracker-deployment')
+        run: docker build --tag habit-tracker-api:${{ github.sha }} .
+      - name: Sign in to Docker Hub
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/feature/habit-tracker-deployment')
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: echo "$DOCKERHUB_TOKEN" | docker login --username "$DOCKERHUB_USERNAME" --password-stdin
+      - name: Build and publish image
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/feature/habit-tracker-deployment')
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          IMAGE="$DOCKERHUB_USERNAME/habit-tracker-api"
+          docker build --tag "$IMAGE:${{ github.sha }}" --tag "$IMAGE:latest" .
+          docker push "$IMAGE:${{ github.sha }}"
+          docker push "$IMAGE:latest"
+
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-24.04-arm
+    needs: build
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/feature/habit-tracker-deployment')
+    environment: production
+    env:
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+      SSH_PORT: ${{ secrets.SSH_PORT }}
+      SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+      SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+      DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+      - name: Check deployment settings
+        run: |
+          for NAME in SSH_HOST SSH_USER SSH_PRIVATE_KEY SSH_KNOWN_HOSTS DEPLOY_PATH DOCKERHUB_USERNAME TAILSCALE_AUTHKEY; do
+            if [ -z "${!NAME}" ]; then
+              echo "::error::Missing deployment secret: $NAME"
+              exit 1
+            fi
+          done
+      - name: Connect to deployment network
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          ping: ${{ secrets.SSH_HOST }}
+      - name: Configure SSH
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+      - name: Copy deployment configuration
+        run: |
+          PORT="${SSH_PORT:-22}"
+          ssh -o BatchMode=yes -p "$PORT" "$SSH_USER@$SSH_HOST" "test -f '$DEPLOY_PATH/.env' && mkdir -p '$DEPLOY_PATH/nginx'"
+          scp -P "$PORT" docker-compose.yml "$SSH_USER@$SSH_HOST:$DEPLOY_PATH/"
+          scp -P "$PORT" nginx/default.conf "$SSH_USER@$SSH_HOST:$DEPLOY_PATH/nginx/"
+      - name: Transfer published image
+        run: |
+          set -o pipefail
+          PORT="${SSH_PORT:-22}"
+          IMAGE="$DOCKERHUB_USERNAME/habit-tracker-api:${{ github.sha }}"
+          docker pull "$IMAGE"
+          docker save "$IMAGE" | gzip -1 | ssh -o BatchMode=yes -p "$PORT" "$SSH_USER@$SSH_HOST" "gunzip | docker load"
+      - name: Restart application
+        run: |
+          PORT="${SSH_PORT:-22}"
+          IMAGE="$DOCKERHUB_USERNAME/habit-tracker-api:${{ github.sha }}"
+          ssh -o BatchMode=yes -p "$PORT" "$SSH_USER@$SSH_HOST" \
+            "set -e; cd '$DEPLOY_PATH'; sed -i 's|^DOCKER_IMAGE=.*|DOCKER_IMAGE=$IMAGE|' .env; docker compose up -d --no-build --pull never --wait --wait-timeout 180; docker compose exec -T nginx nginx -s reload; curl --fail --retry 6 --retry-connrefused --retry-delay 5 http://127.0.0.1:8087/api/docs/ > /dev/null"
